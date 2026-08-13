@@ -22,6 +22,25 @@ $OpenCvExeUrl      = "https://github.com/opencv/opencv/releases/download/4.13.0/
 $OpenCvExe         = Join-Path $DownloadDir "opencv-4.13.0-windows.exe"
 $OpenCvExtractDir  = Join-Path $DepsDir "opencv"
 
+$EigenZipUrl       = "https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.zip"
+$EigenZip          = Join-Path $DownloadDir "eigen-3.4.0.zip"
+$EigenExtractDir   = Join-Path $DepsDir "eigen"
+
+$GtsamZipUrl       = "https://github.com/borglab/gtsam/archive/refs/tags/4.2.2.zip"
+$GtsamZip          = Join-Path $DownloadDir "gtsam-4.2.2.zip"
+$GtsamSourceDir    = Join-Path $DepsDir "gtsam-src"
+$GtsamInstallDir   = Join-Path $DepsDir "gtsam-install"
+
+# GTSAM 4.2.2 (the latest stable release) unconditionally requires Boost to build on Windows -
+# there is no released version yet with the boost-optional flags seen on GTSAM's unreleased main
+# branch. vcpkg is what GTSAM's own build docs recommend for getting prebuilt Boost on Windows.
+# Installing the full "boost" metapackage (not just the components find_package(Boost COMPONENTS...)
+# asks for) because GTSAM's .cpp/.h files directly #include several other header-only Boost
+# libraries (boost/assign, boost/ptr_container, ...) that aren't pulled in by the component libs alone.
+$VcpkgDir          = Join-Path $DepsDir "vcpkg"
+$VcpkgExe          = Join-Path $VcpkgDir "vcpkg.exe"
+$VcpkgToolchain    = Join-Path $VcpkgDir "scripts\buildsystems\vcpkg.cmake"
+
 function Write-Step($msg) {
     Write-Host ""
     Write-Host "==> $msg" -ForegroundColor Cyan
@@ -76,6 +95,74 @@ function Expand-DepthaiIfMissing {
     }
 }
 
+function Expand-EigenIfMissing {
+    if (Test-Path (Join-Path $EigenExtractDir "Eigen\Dense")) {
+        Write-Host "Eigen already extracted."
+        return
+    }
+    Write-Host "Extracting Eigen..."
+    New-Item -ItemType Directory -Force -Path $EigenExtractDir | Out-Null
+    Expand-Archive -Path $EigenZip -DestinationPath $EigenExtractDir -Force
+    $inner = Join-Path $EigenExtractDir "eigen-3.4.0"
+    if (Test-Path $inner) {
+        Get-ChildItem $inner | Move-Item -Destination $EigenExtractDir -Force
+        Remove-Item $inner -Recurse -Force
+    }
+}
+
+function Expand-GtsamSourceIfMissing {
+    if (Test-Path (Join-Path $GtsamSourceDir "CMakeLists.txt")) {
+        Write-Host "GTSAM source already extracted."
+        return
+    }
+    Write-Host "Extracting GTSAM source..."
+    New-Item -ItemType Directory -Force -Path $GtsamSourceDir | Out-Null
+    Expand-Archive -Path $GtsamZip -DestinationPath $GtsamSourceDir -Force
+    $inner = Join-Path $GtsamSourceDir "gtsam-4.2.2"
+    if (Test-Path $inner) {
+        Get-ChildItem $inner | Move-Item -Destination $GtsamSourceDir -Force
+        Remove-Item $inner -Recurse -Force
+    }
+}
+
+function Install-VcpkgIfMissing {
+    if (Test-Path $VcpkgExe) {
+        Write-Host "vcpkg already bootstrapped."
+        return
+    }
+    Write-Host "Cloning + bootstrapping vcpkg (used only to get a prebuilt Boost for GTSAM)..."
+    git clone --depth 1 https://github.com/microsoft/vcpkg.git $VcpkgDir
+    & (Join-Path $VcpkgDir "bootstrap-vcpkg.bat")
+}
+
+function Install-BoostIfMissing {
+    Write-Host "Installing full Boost via vcpkg (large - GTSAM's source pulls in more than just the CMake-required components)..."
+    & $VcpkgExe install boost --triplet x64-windows
+}
+
+function Build-GtsamIfMissing {
+    if (Test-Path (Join-Path $GtsamInstallDir "lib\cmake\GTSAM\GTSAMConfig.cmake")) {
+        Write-Host "GTSAM already built and installed."
+        return
+    }
+    Write-Host "Configuring + building GTSAM (this is large - expect a long build)..."
+    $gtsamBuildDir = Join-Path $GtsamSourceDir "build"
+    cmake -S $GtsamSourceDir -B $gtsamBuildDir -A x64 `
+        -DCMAKE_TOOLCHAIN_FILE="$VcpkgToolchain" `
+        -DVCPKG_TARGET_TRIPLET=x64-windows `
+        -DCMAKE_INSTALL_PREFIX="$GtsamInstallDir" `
+        -DCMAKE_BUILD_TYPE=Release `
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 `
+        -DGTSAM_USE_SYSTEM_EIGEN=OFF `
+        -DGTSAM_BUILD_TESTS=OFF `
+        -DGTSAM_BUILD_EXAMPLES_ALWAYS=OFF `
+        -DGTSAM_BUILD_UNSTABLE=OFF   # gtsam_unstable hits duplicate-symbol LNK2005 errors as a
+                                     # shared lib on MSVC (LPInitSolver's std::map<Key,Key>
+                                     # instantiation clashes with gtsam.dll's). We don't need
+                                     # anything from gtsam_unstable, so just skip building it.
+    cmake --build $gtsamBuildDir --config Release --target install
+}
+
 function Expand-OpenCvIfMissing {
     if (Test-Path (Join-Path $OpenCvExtractDir "build\OpenCVConfig.cmake")) {
         Write-Host "OpenCV already extracted."
@@ -102,19 +189,33 @@ New-Item -ItemType Directory -Force -Path $DownloadDir | Out-Null
 Write-Step "Downloading dependencies"
 Get-FileIfMissing $DepthaiZipUrl $DepthaiZip
 Get-FileIfMissing $OpenCvExeUrl $OpenCvExe
+Get-FileIfMissing $EigenZipUrl $EigenZip
+Get-FileIfMissing $GtsamZipUrl $GtsamZip
 
 Write-Step "Extracting dependencies"
 Expand-DepthaiIfMissing
 Expand-OpenCvIfMissing
+Expand-EigenIfMissing
+Expand-GtsamSourceIfMissing
+
+Write-Step "Setting up vcpkg + Boost (needed by GTSAM)"
+Install-VcpkgIfMissing
+Install-BoostIfMissing
+
+Write-Step "Building GTSAM"
+Build-GtsamIfMissing
 
 Write-Step "Configuring project"
 $PrefixPath = "$DepthaiExtractDir;$OpenCvExtractDir\build"
-cmake -S $RepoDir -B "$RepoDir\build" -A x64 -DCMAKE_PREFIX_PATH="$PrefixPath"
+# GTSAMConfig.cmake itself calls find_dependency(Boost), so the project configure
+# needs the vcpkg toolchain too, not just GTSAM's own build.
+cmake -S $RepoDir -B "$RepoDir\build" -A x64 -DCMAKE_PREFIX_PATH="$PrefixPath" `
+    -DCMAKE_TOOLCHAIN_FILE="$VcpkgToolchain" -DVCPKG_TARGET_TRIPLET=x64-windows
 
-Write-Step "Building HelloWorld (Release)"
+Write-Step "Building all targets (Release)"
 cmake --build "$RepoDir\build" --config Release
 
 Write-Step "Done"
-$exe = Join-Path $RepoDir "build\Release\HelloWorld.exe"
+$exe = Join-Path $RepoDir "build\Release\VIO.exe"
 Write-Host "Binary (self-contained, all DLLs copied alongside it): $exe"
 Write-Host "Run it with: & `"$exe`""
